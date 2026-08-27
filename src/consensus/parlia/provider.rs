@@ -6,6 +6,15 @@ use std::sync::Arc;
 use crate::chainspec::BscChainSpec;
 
 use crate::consensus::parlia::{CHECKPOINT_INTERVAL, Parlia, VoteAddress};
+use crate::hardforks::BscHardforks;
+
+/// Distance back from a checkpoint block to the header carrying the active validator set.
+/// Matches `offset` in bsc-geth's `Parlia.snapshot()`.
+const CHECKPOINT_SNAPSHOT_OFFSET: u64 = 200;
+
+/// Only trust a checkpoint bootstrap once the walk is deeper than any reorg could reach.
+/// Mirrors geth's `params.FullImmutabilityThreshold` guard on the same code path.
+const CHECKPOINT_MIN_WALK: usize = 90_000;
 use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
 use crate::node::evm::util::{get_cannonical_header_from_cache, get_header_by_hash_from_cache};
 use alloy_primitives::{Address};
@@ -215,6 +224,96 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
         })
     }
 
+    /// Epoch length in force at this header, mirroring `Snapshot::apply`'s
+    /// `DEFAULT -> LORENTZ -> MAXWELL` progression.
+    fn epoch_length_at(&self, header: &Header) -> u64 {
+        if self.parlia.spec.is_maxwell_active_at_timestamp(header.number, header.timestamp) {
+            super::snapshot::MAXWELL_EPOCH_LENGTH
+        } else if self.parlia.spec.is_lorentz_active_at_timestamp(header.number, header.timestamp) {
+            super::snapshot::LORENTZ_EPOCH_LENGTH
+        } else {
+            super::snapshot::DEFAULT_EPOCH_LENGTH
+        }
+    }
+
+    /// Expected block interval in force at this header.
+    fn block_interval_at(&self, header: &Header) -> u64 {
+        if self.parlia.spec.is_fermi_active_at_timestamp(header.number, header.timestamp) {
+            super::snapshot::FERMI_BLOCK_INTERVAL
+        } else if self.parlia.spec.is_maxwell_active_at_timestamp(header.number, header.timestamp) {
+            super::snapshot::MAXWELL_BLOCK_INTERVAL
+        } else if self.parlia.spec.is_lorentz_active_at_timestamp(header.number, header.timestamp) {
+            super::snapshot::LORENTZ_BLOCK_INTERVAL
+        } else {
+            super::snapshot::DEFAULT_BLOCK_INTERVAL
+        }
+    }
+
+    /// Build a trusted snapshot at a checkpoint block instead of walking back to genesis.
+    ///
+    /// Without this, `try_rebuild` terminates only at genesis, so a node restored from any
+    /// published snapshot (none ship `parlia_snapshots` — bnb's docs say it "will be created
+    /// during runtime") walks ~116M headers and never converges.
+    ///
+    /// This mirrors `bsc-geth`'s `Parlia.snapshot()`: it bootstraps at a block where
+    /// `number % maxwellEpochLength == 200` and reads the validator set from `number - 200`,
+    /// **not** from `number` itself. Per geth's own comment, picking blocks like 1200/2200/3200
+    /// always yields the right validators at `number - 200` whether the epoch length in force
+    /// was 200, 500 or 1000 — because the set encoded in an epoch header only becomes active
+    /// `miner_history_check_len()` blocks later. Building the snapshot at the epoch boundary
+    /// itself activates the set early and BLS attestation signatures then fail to verify.
+    ///
+    /// `recent_proposers` starts empty, which geth also accepts: the "signed recently" rule can
+    /// only reject a proposer present in that map, so an empty map is lenient, not rejecting.
+    fn try_checkpoint_snapshot(&self, header: &Header) -> Option<Snapshot> {
+        let number = header.number;
+        if number <= CHECKPOINT_SNAPSHOT_OFFSET ||
+            number % super::snapshot::MAXWELL_EPOCH_LENGTH != CHECKPOINT_SNAPSHOT_OFFSET
+        {
+            return None;
+        }
+
+        let checkpoint = self.get_canonical_header_by_number(number - CHECKPOINT_SNAPSHOT_OFFSET)?;
+        // geth derives the epoch length from the fork active at `number - offset - 1`.
+        let epoch_ref =
+            self.get_canonical_header_by_number(number - CHECKPOINT_SNAPSHOT_OFFSET - 1)?;
+        let epoch_length = self.epoch_length_at(&epoch_ref);
+
+        let ValidatorsInfo { consensus_addrs, vote_addrs } =
+            self.parlia.parse_validators_from_header(&checkpoint, epoch_length).ok()?;
+        if consensus_addrs.is_empty() {
+            return None;
+        }
+
+        let mut snapshot = Snapshot::new(
+            consensus_addrs,
+            number,
+            header.hash_slow(),
+            epoch_length,
+            vote_addrs,
+        );
+        if let Ok(Some(turn_length)) =
+            self.parlia.get_turn_length_from_header(&checkpoint, epoch_length)
+        {
+            snapshot.turn_length = Some(turn_length);
+        }
+        snapshot.block_interval = self.block_interval_at(header);
+
+        tracing::info!(
+            target: "parlia::snapshot",
+            block = number,
+            validators_from = number - CHECKPOINT_SNAPSHOT_OFFSET,
+            validators = snapshot.validators.len(),
+            epoch_length,
+            turn_length = ?snapshot.turn_length,
+            block_interval = snapshot.block_interval,
+            "Bootstrapped Parlia snapshot from checkpoint instead of walking to genesis"
+        );
+
+        self.base.insert(snapshot.clone());
+        Some(snapshot)
+    }
+
     fn init_genesis_snapshot(&self, genesis_header: &Header) -> Option<Snapshot> {
         let ValidatorsInfo { consensus_addrs, vote_addrs } =
             self.parlia.parse_validators_from_header(
@@ -257,6 +356,15 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 }
                 if let Some(snap) = self.base.snapshot_by_hash(&parent_block_hash) {
                     break Some(snap);
+                }
+                // Once we are deeper than any reorg could reach, terminate at a checkpoint
+                // block instead of continuing to genesis. See `try_checkpoint_snapshot`.
+                if rebuild_block_hashes.len() > CHECKPOINT_MIN_WALK {
+                    if let Some(snap) =
+                        self.try_checkpoint_snapshot(parent_header.as_ref().unwrap())
+                    {
+                        break Some(snap);
+                    }
                 }
                 rebuild_block_hashes.push(parent_block_hash);
                 tracing::trace!("Succeed to walk to parent block, parent_block_number: {}", parent_header.clone().unwrap().number);
