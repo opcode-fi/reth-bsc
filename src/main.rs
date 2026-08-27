@@ -426,6 +426,18 @@ fn main() -> eyre::Result<()> {
                 }
             }
 
+            // Remote ExEx: stream canonical chain notifications to subscribers over gRPC,
+            // matching the `reth-rex` bridge we run on Ethereum mainnet.
+            let rex_notifications = reth_bsc::rex::channel();
+            let rex_server = {
+                let notifications = rex_notifications.clone();
+                tonic::transport::Server::builder()
+                    .http2_keepalive_interval(Some(std::time::Duration::from_secs(300)))
+                    .http2_keepalive_timeout(Some(std::time::Duration::from_secs(60)))
+                    .add_service(reth_bsc::rex::server(notifications))
+                    .serve("[::]:10000".parse().unwrap())
+            };
+
             let (node, engine_handle_tx) = BscNode::new();
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
@@ -544,6 +556,26 @@ fn main() -> eyre::Result<()> {
                         Ok(())
                     })
                     .launch().await?;
+
+            node.task_executor.spawn_critical_task("rex gRPC server", async move {
+                if let Err(err) = rex_server.await {
+                    tracing::error!(target: "bsc::rex", %err, "rex gRPC server exited");
+                }
+            });
+
+            // Feed subscribers off the canonical stream directly rather than through an ExEx.
+            // See `rex::pump_canonical`: the ExEx manager takes notifications in many-per-poll
+            // (WAL-committing each) but delivers one-per-poll, which is fine at Ethereum's 12s
+            // blocks and pins the 1024-slot buffer at BSC's 0.46s blocks. We never read those
+            // notifications anyway.
+            {
+                let notifications = rex_notifications.clone();
+                let provider = node.provider.clone();
+                node.task_executor.spawn_critical_task("rex canon stream", async move {
+                    reth_bsc::rex::pump_canonical(provider, notifications).await;
+                });
+            }
+            tracing::info!(target: "bsc::rex", "Remote ExEx gRPC server listening on [::]:10000");
 
             // Send the engine handle to the network
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();

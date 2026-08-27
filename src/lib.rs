@@ -5,6 +5,7 @@ pub mod hardforks;
 pub mod metrics;
 pub mod node;
 pub mod rpc;
+pub mod rex;
 pub mod shared;
 pub use node::primitives::BscPrimitives;
 pub use node::primitives::{BscBlock, BscBlockBody, BscBlobTransactionSidecar};

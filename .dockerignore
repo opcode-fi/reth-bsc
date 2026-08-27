@@ -1,0 +1,7 @@
+# The Dockerfile compiles from source inside the builder stage and never reads a
+# host-built artifact, so shipping these only inflates the build context. `target/`
+# alone is ~31 GB here, which was the bulk of an 11.5 GB context transfer (~40s)
+# on every image build.
+target/
+dist/
+.git/

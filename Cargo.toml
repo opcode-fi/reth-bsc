@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "testing/bsc-ef-tests"]
+members = [".", "rex-proto", "testing/bsc-ef-tests"]
 
 [package]
 name = "reth_bsc"
@@ -161,6 +161,11 @@ cometbft-proto = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.gi
 cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 
 prost = { version = "0.12.6" }
+rex-proto = { path = "rex-proto" }
+tonic = "0.11"
+bincode = "1"
+reth-exex = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.1.2", features = ["serde"] }
+reth-exex-types = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.1.2", features = ["serde", "serde-bincode-compat"] }
 
 tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = [
     "secp256k1",
@@ -253,3 +258,7 @@ uuid = { version = "1", features = ["v4"] }
 # `test-util` gives tests a paused clock (`start_paused`, `time::advance`), so timing invariants
 # can be asserted by ordering instead of racing a wall clock.
 tokio = { version = "1.44", features = ["full", "test-util"] }
+
+[[example]]
+name = "rex_subscribe"
+path = "examples/rex_subscribe.rs"

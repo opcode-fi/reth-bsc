@@ -7,7 +7,7 @@ LABEL org.opencontainers.image.source=https://github.com/bnb-chain/reth-bsc
 LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 # Install system dependencies
-RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
+RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config protobuf-compiler
 
 # Builds a cargo-chef plan
 FROM chef AS planner
