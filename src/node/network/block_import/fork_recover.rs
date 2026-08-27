@@ -297,7 +297,41 @@ impl RecoverTarget {
 ///    re-evaluates canonical selection.
 ///
 /// See [`RecoverTarget`] for the parent-start vs single-pair design.
+/// Fetch a head's missing ancestors from `peer`, import them, and FCU.
+///
+/// Thin timing wrapper: every fetch is measured and fed to
+/// [`registry::record_fetch_latency`] so peer selection can steer away from slow peers.
+/// Failures are recorded too -- a fetch that burns `FETCH_TIMEOUT` per hop is exactly the
+/// case worth penalising, and excluding it would make a slow peer look good by omission.
 pub async fn recover_ancestors<P>(
+    peer: PeerId,
+    target: RecoverTarget,
+    provider: P,
+    engine: ConsensusEngineHandle<BscPayloadTypes>,
+    forkchoice_engine: BscForkChoiceEngine<P>,
+    fetcher: &dyn RangeFetcher,
+) -> Result<(), ForkRecoverError>
+where
+    P: BlockHashReader
+        + BlockNumReader
+        + HeaderProvider<Header = alloy_consensus::Header>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let started = std::time::Instant::now();
+    let outcome =
+        recover_ancestors_measured(peer, target, provider, engine, forkchoice_engine, fetcher)
+            .await;
+    crate::node::network::bsc_protocol::registry::record_fetch_latency(
+        peer,
+        started.elapsed().as_secs_f64(),
+    );
+    outcome
+}
+
+async fn recover_ancestors_measured<P>(
     peer: PeerId,
     target: RecoverTarget,
     provider: P,

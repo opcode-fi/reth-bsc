@@ -130,18 +130,117 @@ where
     failed_heads: crate::node::network::block_import::fork_recover::FailedHeadsCooler,
     /// Periodic timer for head announcement.
     announce_interval: tokio::time::Interval,
+    /// Admission control for spawned ancestor recoveries.
+    ///
+    /// `recovering_heads` dedups per block hash, but while the node is falling behind
+    /// every announced head is a fresh hash, so it never matches and spawns are
+    /// unbounded. Each recovery walks back to the same common ancestor and re-imports
+    /// the same range, starving the engine of the capacity it needs for live blocks and
+    /// driving the node further behind.
+    recovery_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
-/// Pick a peer to route `GetBlocksByRange` to. Only bsc/2 peers qualify —
-/// bsc/1 peers don't speak `GetBlocksByRange` and would kick us with
-/// `SubprotocolSpecific`. Prefer the announcing peer if it's bsc/2;
-/// otherwise pick any registered bsc/2 peer.
+/// Max ancestor recoveries in flight. Not 1: `resolve_bsc_peer_static` can route every
+/// recovery at the same peer, so strict single-flight lets one unresponsive peer stall
+/// all catch-up.
+const MAX_CONCURRENT_RECOVERIES: usize = 3;
+
+/// How far ahead of our canonical tip an announced head may be before it is worth
+/// spawning ancestor recovery.
+///
+/// `PayloadStatusEnum::Syncing` does NOT mean "go fetch the parent". engine-tree has
+/// already BUFFERED the payload and will attach it via `try_connect_buffered_blocks`
+/// the moment the parent lands — see reth `engine/tree` `mod.rs`, which documents the
+/// status as "Parent missing, payload buffered for later".
+///
+/// On Ethereum's 12s slots that buffering window is never observed: block N is long
+/// since executed when N+1 is gossiped. On BSC's 450ms slots it is the COMMON case —
+/// a peer announces N+1 while we are still executing N. Measured on this node over a
+/// 6-minute window (1,685 spawns): 77% targeted a block at our own tip, 95% were
+/// within one block of it, and the ancestor walk depth was 0 in 99.3% of them, i.e.
+/// there was no fork to recover. Each spawn still paid a peer round-trip and re-imported
+/// payloads that competed with live blocks, which is what held the head 6-25s behind the
+/// chain while throughput itself matched it exactly.
+///
+/// Suppressing recovery this close to the tip is self-healing: if the node genuinely
+/// wedges, its tip stops advancing, the gap grows past this bound, and recovery fires
+/// exactly as it did before.
+const NEAR_TIP_BUFFER_BLOCKS: u64 = 3;
+
+/// How far ahead of our tip a HASH ANNOUNCEMENT may be before it is worth fetching.
+///
+/// Deliberately tighter than `NEAR_TIP_BUFFER_BLOCKS`: there we already hold the block
+/// and the engine has buffered it, so waiting costs nothing. Here we hold only a hash,
+/// so suppressing too eagerly would mean never fetching a block nobody sends us.
+///
+/// A delta of 1 is the ordinary case -- we are at the tip and a peer is announcing the
+/// block that is, right now, also in flight to us as a full `NewBlock`. Fetching it is a
+/// race we usually lose, and losing it costs a peer round-trip plus a re-import that
+/// competes with live execution. Anything further ahead means gossip did not deliver, so
+/// we fetch.
+///
+/// Self-limiting: if the full block genuinely never arrives, our tip stops advancing, the
+/// next announcement is delta 2, and recovery fires -- bounding the worst case at roughly
+/// one block (~450ms) rather than the previous storm.
+const NEAR_TIP_ANNOUNCE_BLOCKS: u64 = 1;
+
+/// A peer's mean fetch latency above which we stop sending it fetches.
+///
+/// From 1,402 measured fetches on this node: eight of eighteen well-sampled peers had a
+/// median above 2s, and those eight served 53% of fetches while burning 70% of all fetch
+/// time (4,641s of 6,622s). The fastest peers sat at 0.12-0.18s, a ~20x difference.
+const SLOW_PEER_SECS: f64 = 2.0;
+
+/// Pick the peer to route `GetBlocksByRange` to when fetching a missing head.
+///
+/// Only bsc/2 peers qualify: bsc/1 peers do not speak `GetBlocksByRange` and would kick us
+/// with `SubprotocolSpecific`.
+///
+/// Policy, in order:
+///   1. Use the announcer when it speaks v2 -- it demonstrably HAS the block, so this is
+///      correct by construction and is the common case.
+///   2. Unless the announcer is MEASURED slow (see `SLOW_PEER_SECS`), in which case divert
+///      to the measured-fastest peer.
+///   3. If the announcer cannot serve us at all (not v2), prefer the measured-fastest peer,
+///      falling back to the head of the list before we have measurements.
+///
+/// The "measured" qualifier is the whole design. Round-robin across all v2 peers was tried
+/// and was dramatically worse -- blocks-behind median 0.8 -> 27.7, recovery p90 7.55s ->
+/// 17.61s -- because most peers are slower than whichever one we were already using. Any
+/// policy that reassigns fetches without regard to speed loses. This one only ever moves
+/// work from a peer known to be slow to a peer known to be fast, and does nothing until it
+/// has evidence for both.
 fn resolve_bsc_peer_static(announcer: PeerId) -> Option<PeerId> {
-    if crate::node::network::bsc_protocol::registry::is_v2_peer(announcer) {
-        Some(announcer)
-    } else {
-        crate::node::network::bsc_protocol::registry::list_v2_peers().into_iter().next()
+    use crate::node::network::bsc_protocol::registry;
+
+    if registry::is_v2_peer(announcer) {
+        // Divert only on evidence: a measured-slow announcer AND a measured alternative
+        // that is at least twice as fast, so we do not churn between comparable peers.
+        if let Some(announcer_secs) = registry::peer_fetch_ewma(announcer) {
+            if announcer_secs > SLOW_PEER_SECS {
+                if let Some(best) = registry::fastest_v2_peer() {
+                    if best != announcer {
+                        if let Some(best_secs) = registry::peer_fetch_ewma(best) {
+                            if best_secs * 2.0 < announcer_secs {
+                                tracing::debug!(
+                                    target: "bsc::block_import",
+                                    slow_peer = %announcer,
+                                    slow_secs = announcer_secs,
+                                    fast_peer = %best,
+                                    fast_secs = best_secs,
+                                    "Diverting fetch from a measured-slow peer"
+                                );
+                                return Some(best);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Some(announcer);
     }
+
+    registry::fastest_v2_peer().or_else(|| registry::list_v2_peers().into_iter().next())
 }
 
 impl<Provider> ImportService<Provider>
@@ -198,6 +297,9 @@ where
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval
             },
+            recovery_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_RECOVERIES,
+            )),
         }
     }
 
@@ -207,6 +309,7 @@ where
         let forkchoice_engine = self.forkchoice_engine.clone();
         let recovering_heads = self.recovering_heads.clone();
         let failed_heads = self.failed_heads.clone();
+        let recovery_slots = self.recovery_slots.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
@@ -276,10 +379,23 @@ where
                         None
                     }
                     PayloadStatusEnum::Syncing => {
-                        // Parent block is missing. Launch fork-aware ancestor
-                        // recovery rather than a naive range fetch + premature
-                        // FCU. The recovery task also owns the final FCU.
+                        // The payload is BUFFERED, not lost: engine-tree attaches it as
+                        // soon as the parent arrives. Only reach for fork-aware ancestor
+                        // recovery when the head is far enough ahead that buffering cannot
+                        // close the gap on its own -- see `NEAR_TIP_BUFFER_BLOCKS`.
                         let block_number = header.number;
+                        if let Ok(tip) = forkchoice_engine.provider.best_block_number() {
+                            if block_number <= tip.saturating_add(NEAR_TIP_BUFFER_BLOCKS) {
+                                tracing::debug!(
+                                    target: "bsc::block_import",
+                                    %block_hash,
+                                    block_number,
+                                    tip,
+                                    "Skipping fork recovery: payload buffered near tip"
+                                );
+                                return None;
+                            }
+                        }
                         tracing::info!(
                             target: "bsc::block_import",
                             %block_hash,
@@ -302,6 +418,18 @@ where
                         // Fire-and-forget spawn; `recover_ancestors` runs its
                         // own Phase-1 local checks so it's correct even if the
                         // head is already on chain by the time the task starts.
+                        // Acquire before touching `recovering_heads`: only
+                        // `RecoveringHeadGuard` removes an entry, so inserting a hash we
+                        // then skip would wedge it until process exit.
+                        let Ok(slot) = recovery_slots.clone().try_acquire_owned() else {
+                            tracing::debug!(
+                                target: "bsc::block_import",
+                                %block_hash, block_number,
+                                max = MAX_CONCURRENT_RECOVERIES,
+                                "Skipping fork recovery: already at the concurrent-recovery cap"
+                            );
+                            return None;
+                        };
                         {
                             let mut guard = recovering_heads.lock();
                             if guard.contains(&block_hash) {
@@ -326,6 +454,7 @@ where
                                 header.clone(),
                             );
                         tokio::spawn(async move {
+                            let _slot = slot;
                             let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                                 block_hash, recovering,
                             );
@@ -781,7 +910,44 @@ where
                 continue;
             }
 
+            // This function's contract is "any head we do not already have", but nothing
+            // verified the second half, so a head imported seconds ago re-spawned a full
+            // recovery every time another peer announced it -- measured at 4.4 spawns per
+            // block height, with one height hit 20 times. The LRU caches cannot cover it:
+            // BSC gossips ~2.2 blocks/s to 24 peers, so 100 entries hold a few seconds.
+            //
+            // `header` resolves through `get_in_memory_or_storage_by_block`, so a block
+            // still in the in-memory canonical tree already counts as held -- this does
+            // not wait on persistence.
+            match self.forkchoice_engine.provider.header(hash_number.hash) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(err) => {
+                    // Fall through to recovery: failing to answer "do we have it?" is not
+                    // a reason to stop importing.
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        block_hash = %hash_number.hash,
+                        error = %err,
+                        "Could not check whether announced head is already held"
+                    );
+                }
+            }
+
             let delta = hash_number.number.saturating_sub(local_tip);
+
+            // Near-tip announcements race the full block that is already on its way; see
+            // `NEAR_TIP_ANNOUNCE_BLOCKS`.
+            if delta <= NEAR_TIP_ANNOUNCE_BLOCKS {
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    block_hash = %hash_number.hash,
+                    block_number = hash_number.number,
+                    local_tip,
+                    "Skipping fork recovery: announced head is at the tip"
+                );
+                continue;
+            }
             if delta > PIPELINE_TRIGGER_DELTA {
                 // Far-behind: fork_recover's 2048-ancestor walk cannot close
                 // this gap. Mark processed so subsequent announcements of the
@@ -799,6 +965,19 @@ where
                 );
                 continue;
             }
+
+            // Admission control first — see `recovery_slots`. Only `RecoveringHeadGuard`
+            // clears `recovering_heads`, so inserting then skipping would wedge the hash.
+            let Ok(slot) = self.recovery_slots.clone().try_acquire_owned() else {
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    block_hash = %hash_number.hash,
+                    block_number = hash_number.number,
+                    max = MAX_CONCURRENT_RECOVERIES,
+                    "Skipping fork recovery: already at the concurrent-recovery cap"
+                );
+                continue;
+            };
 
             // Concurrent-dedup: one recovery per head at a time.
             {
@@ -827,6 +1006,7 @@ where
             let head_num = hash_number.number;
 
             tokio::spawn(async move {
+                let _slot = slot;
                 let _guard =
                     crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                         head_hash, recovering,

@@ -106,6 +106,81 @@ pub fn is_v2_peer(peer: PeerId) -> bool {
 }
 
 /// Snapshot of peers that negotiated bsc/2 (i.e. support `GetBlocksByRange`).
+/// Rolling per-peer fetch latency, used to steer block fetches away from slow peers.
+///
+/// Measured on this node over ~3h (1,402 fetches, 54 peers): per-peer median latency spans
+/// 0.12s to 5.63s -- a 47x spread. Eight of the eighteen well-sampled peers had a median
+/// above 2s; they served 53% of fetches but burned 70% of all fetch time (4,641s of 6,622s).
+/// The single busiest peer was among the slowest, at a 3.46s median and a 103s worst case.
+///
+/// That tail is what the node's visible lag is made of: a block that is slow to fetch holds
+/// up every block behind it, and at 450ms slots a few seconds becomes tens of blocks.
+struct PeerLatency {
+    /// Exponentially weighted mean fetch duration, seconds.
+    ewma_secs: f64,
+    samples: u32,
+}
+
+static PEER_FETCH_LATENCY: Lazy<RwLock<HashMap<PeerId, PeerLatency>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Weight of the newest sample. 0.2 tracks a peer degrading over ~10 fetches without letting
+/// one unlucky timeout condemn an otherwise fast peer.
+const LATENCY_EWMA_ALPHA: f64 = 0.2;
+
+/// Fetches needed before a peer's average is worth acting on.
+const MIN_LATENCY_SAMPLES: u32 = 5;
+
+/// Record how long a completed fetch from `peer` took.
+pub fn record_fetch_latency(peer: PeerId, secs: f64) {
+    if !secs.is_finite() || secs < 0.0 {
+        return;
+    }
+    if let Ok(mut g) = PEER_FETCH_LATENCY.write() {
+        let e = g.entry(peer).or_insert(PeerLatency { ewma_secs: secs, samples: 0 });
+        e.ewma_secs = if e.samples == 0 {
+            secs
+        } else {
+            LATENCY_EWMA_ALPHA * secs + (1.0 - LATENCY_EWMA_ALPHA) * e.ewma_secs
+        };
+        e.samples = e.samples.saturating_add(1);
+    }
+}
+
+/// Mean fetch latency for `peer`, once enough samples exist to mean anything.
+pub fn peer_fetch_ewma(peer: PeerId) -> Option<f64> {
+    let g = PEER_FETCH_LATENCY.read().ok()?;
+    let e = g.get(&peer)?;
+    (e.samples >= MIN_LATENCY_SAMPLES).then_some(e.ewma_secs)
+}
+
+/// The fastest v2 peer we have enough measurements to trust.
+///
+/// Deliberately returns a MEASURED-fastest peer rather than an arbitrary one. Spreading
+/// fetches across all peers round-robin was tried and was much worse (blocks-behind median
+/// 0.8 -> 27.7): most peers are slower than the one we happened to be using, so any policy
+/// that picks without regard to speed loses.
+pub fn fastest_v2_peer() -> Option<PeerId> {
+    let lat = PEER_FETCH_LATENCY.read().ok()?;
+    list_v2_peers()
+        .into_iter()
+        .filter_map(|p| {
+            lat.get(&p)
+                .filter(|e| e.samples >= MIN_LATENCY_SAMPLES)
+                .map(|e| (p, e.ewma_secs))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(p, _)| p)
+}
+
+/// Snapshot for logging/diagnostics: (peer, ewma_secs, samples), fastest first.
+pub fn fetch_latency_snapshot() -> Vec<(PeerId, f64, u32)> {
+    let Ok(g) = PEER_FETCH_LATENCY.read() else { return Vec::new() };
+    let mut v: Vec<_> = g.iter().map(|(p, e)| (*p, e.ewma_secs, e.samples)).collect();
+    v.sort_by(|a, b| a.1.total_cmp(&b.1));
+    v
+}
+
 pub fn list_v2_peers() -> Vec<PeerId> {
     match REGISTRY.read() {
         Ok(guard) => guard
