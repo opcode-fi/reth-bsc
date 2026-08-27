@@ -88,7 +88,6 @@ where
 
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
-            // TODO: need fix it later, it may got error when restart the node?
             let (validator_set, vote_addresses) = self.get_current_validators_with_cache(header.number-1, header.parent_hash)?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
@@ -198,6 +197,18 @@ where
         to: Address,
         data: Bytes
     ) -> Result<Bytes, BlockExecutionError> {
+        self.eth_call_at_block(to, data, None)
+    }
+
+    /// `eth_call` with `block.number` pinned to `at_block`, matching go-bsc's
+    /// `eth_call` against an explicit block hash. Required for system-contract views
+    /// whose result depends on the block context.
+    pub(crate) fn eth_call_at_block(
+        &mut self,
+        to: Address,
+        data: Bytes,
+        at_block: Option<u64>,
+    ) -> Result<Bytes, BlockExecutionError> {
         // Use block gas limit (~36M on BSC) to match GASLIMIT opcode semantics.
         // Mark as system transaction to bypass EIP-7825 gas limit cap (16M),
         // since block gas limit exceeds the cap and these are internal queries.
@@ -228,6 +239,7 @@ where
                 authorization_list: Default::default(),
             },
             is_system_transaction: true,
+            block_number_override: at_block.map(U256::from),
         };
 
         let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
@@ -246,11 +258,11 @@ where
 
         let result = if self.spec.is_luban_active_at_block(block_number) {
             let (to, data) = self.system_contracts.get_current_validators();
-            let output = self.eth_call(to, data)?;
+            let output = self.eth_call_at_block(to, data, Some(block_number))?;
             self.system_contracts.unpack_data_into_validator_set(&output)
         } else {
             let (to, data) = self.system_contracts.get_current_validators_before_luban(block_number);
-            let output = self.eth_call(to, data)?;
+            let output = self.eth_call_at_block(to, data, Some(block_number))?;
             let validator_set = self.system_contracts.unpack_data_into_validator_set_before_luban(&output);
             (validator_set, Vec::new())
         };

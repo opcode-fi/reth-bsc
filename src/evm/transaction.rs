@@ -15,11 +15,13 @@ use revm::{
 pub struct BscTxEnv {
     pub base: TxEnv,
     pub is_system_transaction: bool,
+    /// Pins `block.number` for the duration of this call.
+    pub block_number_override: Option<U256>,
 }
 
 impl BscTxEnv {
     pub fn new(base: TxEnv) -> Self {
-        Self { base, is_system_transaction: false }
+        Self { base, is_system_transaction: false, block_number_override: None }
     }
 }
 
@@ -118,7 +120,7 @@ impl FromTxWithEncoded<TransactionSigned> for BscTxEnv {
             reth_ethereum_primitives::Transaction::Eip7702(tx) => TxEnv::from_recovered_tx(&tx, sender),
         };
 
-        Self { base, is_system_transaction: false }
+        Self { base, is_system_transaction: false, block_number_override: None }
     }
 }
 
@@ -150,7 +152,7 @@ impl SystemCallTx for BscTxEnv {
             .build()
             .unwrap();
 
-        Self { base, is_system_transaction: true }
+        Self { base, is_system_transaction: true, block_number_override: None }
     }
 }
 
@@ -168,6 +170,7 @@ impl<Spec, BlockEnv: alloy_evm::env::BlockEnvironment> TryIntoTxEnv<BscTxEnv, Sp
                 self, evm_env,
             )?,
             is_system_transaction: false,
+            block_number_override: None,
         })
     }
 }
@@ -189,6 +192,7 @@ mod tests {
                 ..Default::default()
             },
             is_system_transaction: false,
+            block_number_override: None,
         };
 
         assert_eq!(bsc_tx.tx_type(), 0);

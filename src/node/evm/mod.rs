@@ -71,6 +71,13 @@ where
         // RPCs do not — let `prepare` mark them idempotently for `BscHandler`.
         self.prepare_tx_for_execution(&mut tx);
 
+        // BSCValidatorSet.getMiningValidators() rotates working candidates by
+        // `block.number / 200`, so it MUST be read in the parent's context. go-bsc gets
+        // this for free via eth_call pinned to the parent hash; here the call runs inside
+        // the child's EVM, which shifts the shuffle seed at every epoch block.
+        let saved_number =
+            tx.block_number_override.map(|n| core::mem::replace(&mut self.block.number, n));
+
         let saved_env = if tx.is_system_transaction {
             self.fund_beneficiary_for_system_tx_replay(tx.base.value);
             Some((
@@ -88,6 +95,10 @@ where
             self.block.gas_limit = gas_limit;
             self.block.basefee = basefee;
             self.cfg.disable_nonce_check = disable_nonce_check;
+        }
+
+        if let Some(number) = saved_number {
+            self.block.number = number;
         }
 
         res

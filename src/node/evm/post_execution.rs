@@ -389,6 +389,7 @@ where
                 authorization_list: Default::default(),
             },
             is_system_transaction: true,
+            block_number_override: None,
         };
 
         let block_number = self.evm.block().number().to::<u64>();

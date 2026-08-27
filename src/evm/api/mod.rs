@@ -494,6 +494,70 @@ mod tests {
         );
     }
 
+    /// `block_number_override` must be visible to the NUMBER opcode during the call and
+    /// restored afterwards.
+    ///
+    /// Parlia reads `BSCValidatorSet.getMiningValidators()`, which rotates its working
+    /// candidates by `block.number / 200`. go-bsc evaluates it against the parent via
+    /// `eth_call(..., parentHash)`; here the call runs inside the child's EVM, so without
+    /// the override the shuffle seed is off by one at every epoch block and the node
+    /// computes a different 21-validator set than the block author did.
+    #[test]
+    fn block_number_override_is_seen_by_evm_and_restored() {
+        // NUMBER; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        let code = Bytecode::new_raw(Bytes::from_static(&[
+            0x43, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ]));
+        let caller = Address::from([0x11; 20]);
+        let target = Address::from([0x22; 20]);
+
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let block_env =
+            BlockEnv { number: U256::from(115_596_000u64), gas_limit: 30_000_000, ..Default::default() };
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(1_000_000_000_000_000_000u64), ..Default::default() },
+        );
+        db.insert_account_info(
+            target,
+            AccountInfo { code_hash: code.hash_slow(), code: Some(code), ..Default::default() },
+        );
+
+        let mut evm =
+            BscEvm::new(EvmEnv::new(cfg_env, block_env), db, NoOpInspector, false, false);
+
+        let parent = U256::from(115_595_999u64);
+        let tx = BscTxEnv {
+            base: TxEnv {
+                caller,
+                kind: TxKind::Call(target),
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(56),
+                ..Default::default()
+            },
+            is_system_transaction: false,
+            block_number_override: Some(parent),
+        };
+
+        // Must go through `alloy_evm::Evm::transact` (which delegates to `transact_raw`),
+        // not revm's `ExecuteEvm::transact` — the latter bypasses the BSC wrapper. The
+        // production caller is generic over `EVM: alloy_evm::Evm`, so it takes this path.
+        let out = reth_evm::Evm::transact(&mut evm, tx).expect("call should succeed");
+        let returned = U256::from_be_slice(
+            out.result.output().expect("call should return the NUMBER value").as_ref(),
+        );
+
+        assert_eq!(returned, parent, "NUMBER must observe the overridden block number");
+        assert_eq!(
+            evm.block.number,
+            U256::from(115_596_000u64),
+            "block.number must be restored after the call"
+        );
+    }
+
     #[test]
     fn prepare_is_idempotent_and_does_not_overwrite_pre_marked() {
         // Regression guard for `pre/post_execution` helpers that hand-set
@@ -511,6 +575,7 @@ mod tests {
                 .build()
                 .expect("tx env should build"),
             is_system_transaction: true,
+            block_number_override: None,
         };
 
         evm.prepare_tx_for_execution(&mut tx);
